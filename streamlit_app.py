@@ -6,7 +6,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import fitz  # PyMuPDF
+import pymupdf
+fitz = pymupdf  # alias so rest of code works
 import streamlit as st
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
