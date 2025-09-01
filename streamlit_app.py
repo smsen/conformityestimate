@@ -257,11 +257,21 @@ pages = extract_pages_from_pdf(pdf_bytes)
 sections = split_into_sections(pages)
 ok, missing = coverage_gate(pages, sections)
 
-if not ok:
-    st.error("Cannot provide. Missing: " + ", ".join(missing))
-    with st.expander("Section coverage details"):
-        st.json(section_coverage(sections))
-    st.stop()
+st.info("Finding governance, strategy, and partnerships content")
+sectioner = SemanticSectioner(sim_threshold=0.34)
+sections = sectioner.split(pages)
+
+# advisory warnings only
+total_tokens = sum(token_count(v) for v in sections.values())
+gov_tokens = token_count(sections.get("governance", []))
+strat_tokens = token_count(sections.get("strategy", []))
+part_tokens = token_count(sections.get("partnerships", []))
+if total_tokens < ADVISORY_MIN_WORDS_TOTAL:
+    st.warning(f"Low total text volume detected, {total_tokens} tokens. Interpret results cautiously.")
+if gov_tokens < ADVISORY_MIN_TOKENS_GOV:
+    st.warning(f"Governance like content appears limited, {gov_tokens} tokens.")
+if (strat_tokens + part_tokens) < ADVISORY_MIN_TOKENS_STRAT_OR_PART:
+    st.warning(f"Strategy or partnerships like content appears limited, {strat_tokens + part_tokens} tokens.")
 
 company = guess_company_name(pages)
 st.success(f"Detected company: {company}")
