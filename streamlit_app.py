@@ -1,157 +1,207 @@
+# streamlit_app.py
+# Hivemind or Headless Chickens, free MVP with semantic sectioning
+# Gate removed: the app never rejects, it only warns when content looks thin.
+
 import io
-import os
 import re
-import tempfile
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import fitz
 import streamlit as st
-from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 # -------------------------------
-# configurable bits
+# configuration
 # -------------------------------
 STAGE_OPTIMUM = {"early": 7.0, "growth": 11.0, "late": 15.0}
 STAGE_LABELS = ["early", "growth", "late"]
 
-MIN_WORDS = 3000
-MIN_SECTIONS_REQUIRED = {
-    "governance": 1,
-    "strategy_or_partnership": 1,
-}
+# thresholds are now advisory only, they do not block scoring
+ADVISORY_MIN_WORDS_TOTAL = 3000
+ADVISORY_MIN_TOKENS_GOV = 300
+ADVISORY_MIN_TOKENS_STRAT_OR_PART = 300
 
-SECTION_KEYWORDS = {
-    "governance": ["corporate governance", "board of directors", "directors", "board", "leadership", "management"],
-    "strategy": ["strategy", "strategic", "business model", "letter to shareholders", "ceo letter", "md&a", "management discussion", "operations review"],
-    "partnerships": ["partnerships", "alliances", "joint venture", "ecosystem", "customers", "suppliers", "distributors"],
-}
-
-# seed lexicons, extend later per sector
+# seed lexicons
 INNOVATION_TERMS = [
     "innovation","innovative","innovate","experiment","prototype","breakthrough",
     "research","r&d","invention","novel","disrupt","explore","exploration","pilot",
     "beta","hypothesis","test-and-learn","iterate","iteration","skunkworks","lab","incubate"
 ]
-
 PROCESS_TERMS = [
     "efficiency","efficient","standardise","standardize","compliance","regulatory",
     "control","controls","governance","policy","policies","audit","risk","risk management",
     "brand protection","quality management","six sigma","lean","operational excellence",
     "procedures","protocol","cost discipline","process","processes"
 ]
-
 ISOMORPHISM_TERMS = [
     "best practice","industry standard","benchmark","peer group","comparable",
     "regulatory requirements","compliance with","aligned with standards","iso",
     "certification","accreditation"
 ]
-
 GOVERNANCE_TITLES = [
     "director","non-executive director","independent director","chair","chairman",
     "chief executive officer","ceo","chief financial officer","cfo","chief operating officer",
     "coo","chief technology officer","cto","chief risk officer","cro","executive director"
 ]
 
+# prototypes for semantic sectioning
+PROTOTYPES = {
+    "governance": """
+board composition, directors, independence, committees, audit committee,
+remuneration, nomination, risk oversight, corporate governance code,
+executive officers, leadership biographies, responsibilities, terms of reference
+""",
+    "strategy": """
+strategy, strategic priorities, business model, competitive advantage,
+market positioning, capital allocation, operating model, growth levers,
+management discussion and analysis, md&a, ceo letter, outlook
+""",
+    "partnerships": """
+partnerships, alliances, joint venture, ecosystem partners, customers,
+suppliers, distribution agreements, channel partners, co-development,
+collaboration, memorandum of understanding
+"""
+}
+
 # -------------------------------
-# helpers
+# utilities
 # -------------------------------
 def normalise_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
+def ocai(pci: float, stage: str) -> Tuple[float, str]:
+    cstar = STAGE_OPTIMUM[stage]
+    delta = pci - cstar
+    direction = "Obsolescence" if delta > 0 else "Fragmentation"
+    return abs(delta), direction
+
+def token_count(lst: List[str]) -> int:
+    return sum(len(s.split()) for s in lst)
+
+# -------------------------------
+# robust PDF text extraction
+# -------------------------------
 def extract_pages_from_pdf(file_like) -> List[str]:
-    """Return a list of page texts using PyMuPDF."""
-    pages = []
-    with fitz.open(stream=file_like.read(), filetype="pdf") as doc:
-        for p in doc:
-            text = p.get_text("text")
-            pages.append(normalise_whitespace(text))
-    return pages
-
-HEADER_RE = re.compile(r"^\s*(\d{0,2}\.?\s*)?([A-Z][A-Za-z&/ \-]{3,60})\s*$")
-
-def split_into_sections(pages: List[str]) -> Dict[str, List[str]]:
-    sections = {"governance": [], "strategy": [], "partnerships": [], "other": []}
-    current = "other"
-    for raw in pages:
-        lines = raw.split("\n")
-        buf = []
-        for line in lines:
-            if HEADER_RE.match(line.strip()):
-                if buf:
-                    sections[current].append("\n".join(buf).strip())
-                    buf = []
-                lowered = line.lower()
-                if any(k in lowered for k in SECTION_KEYWORDS["governance"]):
-                    current = "governance"
-                elif any(k in lowered for k in SECTION_KEYWORDS["strategy"]):
-                    current = "strategy"
-                elif any(k in lowered for k in SECTION_KEYWORDS["partnerships"]):
-                    current = "partnerships"
-                else:
-                    current = "other"
-                buf.append(line)
-            else:
-                buf.append(line)
-        if buf:
-            sections[current].append("\n".join(buf).strip())
-    return sections
-
-def section_coverage(sections: Dict[str, List[str]]) -> Dict[str, int]:
-    return {k: sum(1 for s in v if len(s.split()) > 100) for k, v in sections.items()}
-
-def coverage_gate(pages: List[str], sections: Dict[str, List[str]]) -> Tuple[bool, List[str]]:
-    total_words = sum(len(p.split()) for p in pages)
-    cov = section_coverage(sections)
-    has_gov = cov.get("governance", 0) >= MIN_SECTIONS_REQUIRED["governance"]
-    has_strat_or_part = (cov.get("strategy", 0) + cov.get("partnerships", 0)) >= MIN_SECTIONS_REQUIRED["strategy_or_partnership"]
-    ok = (total_words >= MIN_WORDS) and has_gov and has_strat_or_part
-    missing = []
-    if total_words < MIN_WORDS:
-        missing.append(f"minimum words {MIN_WORDS}")
-    if not has_gov:
-        missing.append("governance section")
-    if not has_strat_or_part:
-        missing.append("strategy or partnerships section")
-    return ok, missing
+    """Try PyMuPDF, then pdfplumber, then pdfminer.six, otherwise raise a clear error."""
+    # 1) PyMuPDF
+    try:
+        import fitz  # installed via 'pymupdf'
+        file_like.seek(0)
+        pages = []
+        with fitz.open(stream=file_like.read(), filetype="pdf") as doc:
+            for p in doc:
+                pages.append(normalise_whitespace(p.get_text("text")))
+        if pages and any(pages):
+            return pages
+    except Exception:
+        pass
+    # 2) pdfplumber
+    try:
+        import pdfplumber
+        file_like.seek(0)
+        pages = []
+        with pdfplumber.open(file_like) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                pages.append(normalise_whitespace(text))
+        if pages and any(pages):
+            return pages
+    except Exception:
+        pass
+    # 3) pdfminer.six
+    try:
+        from pdfminer.high_level import extract_text
+        file_like.seek(0)
+        text = extract_text(file_like) or ""
+        pages = [normalise_whitespace(t) for t in text.split("\f") if t.strip()]
+        if pages and any(pages):
+            return pages
+    except Exception:
+        pass
+    raise RuntimeError("Cannot parse PDF with available parsers")
 
 def guess_company_name(pages: List[str]) -> str:
     if not pages:
         return "COMPANY"
     first = pages[0]
     m = re.search(r"([A-Z][A-Za-z&,\.\- ]{2,80})\b(annual report|annual|report)", first, re.I)
-    if m:
-        return m.group(1).strip()
-    return "COMPANY"
+    return m.group(1).strip() if m else "COMPANY"
 
+# -------------------------------
+# semantic sectioner
+# -------------------------------
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+class SemanticSectioner:
+    def __init__(self, sim_threshold: float = 0.34):
+        self.enc = get_embedder()
+        self.labels = list(PROTOTYPES.keys())
+        self.P = self._encode_prototypes()
+        self.sim_threshold = sim_threshold
+
+    def _encode_prototypes(self):
+        vecs = []
+        for k in self.labels:
+            v = self.enc.encode([PROTOTYPES[k].strip()], convert_to_numpy=True, normalize_embeddings=True)
+            vecs.append(v[0])
+        return np.vstack(vecs)  # [3, d]
+
+    def _chunk(self, pages: List[str], min_tokens: int = 80, max_tokens: int = 260, stride: int = 160) -> List[str]:
+        text = "\n\n".join(pages)
+        toks = re.findall(r"\S+", text)
+        chunks = []
+        for i in range(0, max(1, len(toks) - min_tokens), stride):
+            piece = " ".join(toks[i:i+max_tokens])
+            if len(piece.split()) >= min_tokens:
+                chunks.append(piece)
+        if not chunks and len(text.split()) >= min_tokens:
+            chunks = [text]
+        return chunks
+
+    def split(self, pages: List[str]) -> Dict[str, List[str]]:
+        chunks = self._chunk(pages)
+        sections = {"governance": [], "strategy": [], "partnerships": [], "other": []}
+        if not chunks:
+            return sections
+        E = self.enc.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
+        sims = cosine_similarity(E, self.P)  # [n, 3]
+        best = sims.argmax(axis=1)
+        maxv = sims.max(axis=1)
+        for i, ch in enumerate(chunks):
+            if maxv[i] >= self.sim_threshold:
+                sections[self.labels[best[i]]].append(ch)
+            else:
+                sections["other"].append(ch)
+        return sections
+
+# -------------------------------
+# features from semantic sections
+# -------------------------------
 def bag_counts(texts: List[str], vocab: List[str]) -> int:
     if not texts:
         return 0
-    v = CountVectorizer(vocabulary=[t.lower() for t in vocab], lowercase=True, token_pattern=r"(?u)\b[\w\-&]+\b")
-    X = v.fit_transform(texts)
-    return int(X.sum())
+    joined = " \n ".join(texts).lower()
+    total = 0
+    for term in vocab:
+        total += joined.count(term.lower())
+    return int(total)
 
 def lexicon_features(sections: Dict[str, List[str]]) -> Dict[str, float]:
     texts = [t for lst in sections.values() for t in lst]
+    total_tokens = sum(len(t.split()) for t in texts) or 1
     innov = bag_counts(texts, INNOVATION_TERMS)
     proc = bag_counts(texts, PROCESS_TERMS)
     iso = bag_counts(texts, ISOMORPHISM_TERMS)
-    total_tokens = sum(len(t.split()) for t in texts) or 1
-    feats = {
+    return {
         "innov_per_1k": 1000.0 * innov / total_tokens,
         "proc_per_1k": 1000.0 * proc / total_tokens,
         "iso_per_1k": 1000.0 * iso / total_tokens,
         "explore_exploit_ratio": innov / (proc + 1e-6),
     }
-    return feats
-
-@st.cache_resource(show_spinner=False)
-def get_embedder():
-    # small, fast, free
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 def homogeneity_within(sections: Dict[str, List[str]]) -> Dict[str, float]:
     texts = []
@@ -168,19 +218,12 @@ def homogeneity_within(sections: Dict[str, List[str]]) -> Dict[str, float]:
     return {"pairwise_mean_sim": float(tri.mean()), "pairwise_std_sim": float(tri.std())}
 
 def governance_cues(sections: Dict[str, List[str]]) -> Dict[str, int]:
-    # regex counts of titles and unique name-like tokens as a lightweight proxy
     gov_text = " \n ".join(sections.get("governance", []))
-    title_mentions = 0
     lt = gov_text.lower()
-    for t in GOVERNANCE_TITLES:
-        title_mentions += lt.count(t)
-    # naive name proxy, capitalised words pairs
+    title_mentions = sum(lt.count(t) for t in GOVERNANCE_TITLES)
     names = re.findall(r"\b([A-Z][a-z]+ [A-Z][a-zA-Z\-']+)\b", gov_text)
     distinct_people = len(set(names))
-    top_person_repeats = 0
-    if names:
-        counts = pd.Series(names).value_counts()
-        top_person_repeats = int(counts.iloc[0])
+    top_person_repeats = int(pd.Series(names).value_counts().iloc[0]) if names else 0
     return {
         "gov_distinct_people": int(distinct_people),
         "gov_title_mentions": int(title_mentions),
@@ -189,7 +232,6 @@ def governance_cues(sections: Dict[str, List[str]]) -> Dict[str, int]:
 
 def partnership_cues(sections: Dict[str, List[str]]) -> Dict[str, float]:
     text = " \n ".join(sections.get("partnerships", []) + sections.get("strategy", []))
-    # crude org proxy, all caps tokens of length >= 3, minus common words
     org_like = re.findall(r"\b([A-Z][A-Z&\-\.,]{2,})\b", text)
     blacklist = {"AND","THE","FOR","WITH","OUR","THIS","THAT"}
     orgs = [o for o in org_like if o not in blacklist]
@@ -208,8 +250,10 @@ def assemble_numeric_features(sections: Dict[str, List[str]]) -> Dict[str, float
     feats.update(partnership_cues(sections))
     return feats
 
+# -------------------------------
+# transparent scoring
+# -------------------------------
 def heuristic_pci_and_stage(numeric: Dict[str, float]) -> Tuple[float, str]:
-    # transparent, rule based baseline
     pci = 10.0 \
         + 2.5 * np.tanh(numeric.get("proc_per_1k", 0.0) / 10.0) \
         + 2.0 * np.tanh(numeric.get("pairwise_mean_sim", 0.0) * 2.0) \
@@ -225,38 +269,35 @@ def heuristic_pci_and_stage(numeric: Dict[str, float]) -> Tuple[float, str]:
     stage = STAGE_LABELS[int(stage_logits.argmax())]
     return pci, stage
 
-def ocai(pci: float, stage: str) -> Tuple[float, str]:
-    cstar = STAGE_OPTIMUM[stage]
-    delta = pci - cstar
-    direction = "Obsolescence" if delta > 0 else "Fragmentation"
-    return abs(delta), direction
-
 # -------------------------------
 # streamlit UI
 # -------------------------------
 st.set_page_config(page_title="Hivemind or Headless Chickens", layout="centered")
 st.title("Hivemind or Headless Chickens")
-st.caption("Upload a single annual report PDF. The app estimates conformity and stage adjusted risk from the PDF alone. If key sections are missing, it will say it cannot provide an answer.")
+st.caption("Upload one annual report PDF. The app uses semantic sectioning to estimate conformity and stage adjusted risk from the PDF alone. It never rejects, it only warns when content is thin.")
 
 uploaded = st.file_uploader("Upload annual report (PDF)", type=["pdf"])
 
-with st.expander("Settings", expanded=False):
-    st.write("Default thresholds are conservative to avoid overconfident outputs.")
-    st.write(f"Minimum words: {MIN_WORDS}")
-    st.write("Required sections: Governance, and either Strategy or Partnerships")
+with st.expander("Advisory settings", expanded=False):
+    st.write("These thresholds only trigger warnings and do not block scoring.")
+    st.write(f"Advisory minimum total words: {ADVISORY_MIN_WORDS_TOTAL}")
+    st.write(f"Advisory minimum governance-like tokens: {ADVISORY_MIN_TOKENS_GOV}")
+    st.write(f"Advisory minimum strategy or partnerships-like tokens: {ADVISORY_MIN_TOKENS_STRAT_OR_PART}")
 
 if uploaded is None:
     st.info("Please upload a PDF to begin.")
     st.stop()
 
-# keep file in memory for PyMuPDF
 pdf_bytes = io.BytesIO(uploaded.read())
 
 st.info("Parsing PDF")
-pages = extract_pages_from_pdf(pdf_bytes)
-sections = split_into_sections(pages)
-ok, missing = coverage_gate(pages, sections)
+try:
+    pages = extract_pages_from_pdf(pdf_bytes)
+except Exception as e:
+    st.error(f"Cannot parse PDF. {e}")
+    st.stop()
 
+# semantic sectioning
 st.info("Finding governance, strategy, and partnerships content")
 sectioner = SemanticSectioner(sim_threshold=0.34)
 sections = sectioner.split(pages)
@@ -292,7 +333,8 @@ with st.expander("Evidence and features"):
     st.write("Key numeric features")
     st.json(numeric)
 
-with st.expander("Section coverage"):
-    st.json(section_coverage(sections))
+with st.expander("Semantic section coverage (tokens)"):
+    cov = {k: token_count(v) for k, v in sections.items()}
+    st.json(cov)
 
-st.caption("This is a free MVP that uses only the uploaded PDF. It does not enrich with external data. Extend lexicons and heuristics for sector specific performance.")
+st.caption("Free MVP using only the uploaded PDF. No external enrichment. Extend lexicons and thresholds per sector for better performance.")
