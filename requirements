@@ -1,0 +1,7 @@
+streamlit>=1.36.0
+pymupdf>=1.24.4
+scikit-learn>=1.5.0
+sentence-transformers>=3.0.1
+numpy>=1.26.4
+pandas>=2.2.2
+regex>=2024.5.15
