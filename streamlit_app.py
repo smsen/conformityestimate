@@ -6,8 +6,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import pymupdf
-fitz = pymupdf  # alias so rest of code works
+import pdfplumber
 import streamlit as st
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -63,14 +62,14 @@ GOVERNANCE_TITLES = [
 def normalise_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
-def extract_pages_from_pdf(file_like) -> List[str]:
-    """Return a list of page texts using PyMuPDF."""
+def extract_pages_from_pdf(file_like):
     pages = []
-    with fitz.open(stream=file_like.read(), filetype="pdf") as doc:
-        for p in doc:
-            text = p.get_text("text")
-            pages.append(normalise_whitespace(text))
+    with pdfplumber.open(file_like) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            pages.append(text.strip())
     return pages
+
 
 HEADER_RE = re.compile(r"^\s*(\d{0,2}\.?\s*)?([A-Z][A-Za-z&/ \-]{3,60})\s*$")
 
