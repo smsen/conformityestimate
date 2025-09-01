@@ -15,7 +15,7 @@ from sentence_transformers import SentenceTransformer
 # -------------------------------
 # configuration
 # -------------------------------
-STAGE_OPTIMUM = {"early": 7.0, "growth": 11.0, "late": 15.0}
+STAGE_OPTIMUM = {"early": 5.0, "growth": 9.0, "late": 12.0}
 STAGE_LABELS = ["early", "growth", "late"]
 
 # thresholds are now advisory only, they do not block scoring
